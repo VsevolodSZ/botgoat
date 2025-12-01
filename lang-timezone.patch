@@ -1,0 +1,308 @@
+diff --git a/chrome/app/chrome_main_delegate.cc b/chrome/app/chrome_main_delegate.cc
+index 922674d9afd39..7ee61d729408c 100644
+--- a/chrome/app/chrome_main_delegate.cc
++++ b/chrome/app/chrome_main_delegate.cc
+@@ -92,6 +92,7 @@
+ #include "content/public/common/main_function_params.h"
+ #include "content/public/common/profiling.h"
+ #include "content/public/common/url_constants.h"
++#include "content/browser/geoip/geoip_initializer.h"
+ #include "extensions/buildflags/buildflags.h"
+ #include "net/http/http_cache.h"
+ #include "net/url_request/url_request.h"
+@@ -842,6 +843,9 @@ std::optional<int> ChromeMainDelegate::PostEarlyInitialization(
+ 
+   CommonEarlyInitialization();
+ 
++  // Initialize GeoIP BEFORE loading locale so it can override it
++  content::InitializeGeoIPIfNeeded(base::CommandLine::ForCurrentProcess());
++
+   // Initializes the resource bundle and determines the locale.
+   std::string actual_locale = LoadLocalState(
+       chrome_feature_list_creator, invoked_in_browser->is_running_test);
+diff --git a/chrome/browser/BUILD.gn b/chrome/browser/BUILD.gn
+index 6d4761cd68627..8955b311c27f0 100644
+--- a/chrome/browser/BUILD.gn
++++ b/chrome/browser/BUILD.gn
+@@ -1819,6 +1819,7 @@ static_library("browser") {
+   ]
+ 
+   deps = [
++    "//content/browser/geoip",
+     ":active_use_util",
+     ":browser_process",
+     ":expired_flags_list",
+diff --git a/chrome/browser/chrome_resource_bundle_helper.cc b/chrome/browser/chrome_resource_bundle_helper.cc
+index f36b6d7094a4f..52122f166bfb8 100644
+--- a/chrome/browser/chrome_resource_bundle_helper.cc
++++ b/chrome/browser/chrome_resource_bundle_helper.cc
+@@ -19,6 +19,7 @@
+ #include "components/language/core/browser/pref_names.h"
+ #include "components/prefs/pref_registry_simple.h"
+ #include "components/prefs/pref_service.h"
++#include "content/browser/geoip/geoip_initializer.h"
+ #include "extensions/buildflags/buildflags.h"
+ #include "ui/base/resource/resource_bundle.h"
+ 
+@@ -72,15 +73,26 @@ std::string InitResourceBundleAndDetermineLocale(PrefService* local_state,
+ #endif
+ 
+   std::string preferred_locale;
++
++  // Override with GeoIP locale if initialized
++  std::string geoip_locale = content::GetGeoIPLocale();
++  if (!geoip_locale.empty()) {
++    // GetGeoIPLocale returns "ja-JP,ja" - take only first for UI locale
++    size_t comma_pos = geoip_locale.find(',');
++    preferred_locale = (comma_pos != std::string::npos)
++        ? geoip_locale.substr(0, comma_pos)
++        : geoip_locale;
++  } else {
+ #if BUILDFLAG(IS_MAC)
+-  // TODO(markusheintz): Read preference pref::kApplicationLocale in order
+-  // to enforce the application locale.
+-  // Tests always get en-US.
+-  preferred_locale = is_running_tests ? "en-US" : std::string();
++    // TODO(markusheintz): Read preference pref::kApplicationLocale in order
++    // to enforce the application locale.
++    // Tests always get en-US.
++    preferred_locale = is_running_tests ? "en-US" : std::string();
+ #else
+-  preferred_locale =
+-      local_state->GetString(language::prefs::kApplicationLocale);
++    preferred_locale =
++        local_state->GetString(language::prefs::kApplicationLocale);
+ #endif
++  }
+ 
+   TRACE_EVENT0("startup",
+                "ChromeBrowserMainParts::InitResourceBundleAndDetermineLocale");
+diff --git a/chrome/browser/renderer_preferences_util.cc b/chrome/browser/renderer_preferences_util.cc
+index a404289a98c66..06643970349e3 100644
+--- a/chrome/browser/renderer_preferences_util.cc
++++ b/chrome/browser/renderer_preferences_util.cc
+@@ -16,6 +16,7 @@
+ #include "chrome/browser/browser_process.h"
+ #include "chrome/browser/net/convert_explicitly_allowed_network_ports_pref.h"
+ #include "chrome/browser/privacy_sandbox/tracking_protection_settings_factory.h"
++#include "content/browser/geoip/geoip_initializer.h"
+ #include "content/public/browser/reduce_accept_language_utils.h"
+ #if BUILDFLAG(IS_CHROMEOS)
+ #include "chrome/browser/ash/login/demo_mode/demo_session.h"
+@@ -93,6 +94,13 @@ std::vector<std::string> GetLocalIpsAllowedUrls(
+ 
+ std::string GetLanguageListForProfile(Profile* profile,
+                                       const std::string& language_list) {
++  // Override with GeoIP locale if initialized
++  // GetGeoIPLocale() returns both forms: "ja-JP,ja"
++  std::string geoip_locale = content::GetGeoIPLocale();
++  if (!geoip_locale.empty()) {
++    return geoip_locale;
++  }
++
+   if (profile->IsOffTheRecord()) {
+     // In incognito mode return only the first language.
+     return language::GetFirstLanguage(language_list);
+diff --git a/components/variations/service/variations_service.cc b/components/variations/service/variations_service.cc
+index f376efed2dace..e58c568c1dc96 100644
+--- a/components/variations/service/variations_service.cc
++++ b/components/variations/service/variations_service.cc
+@@ -538,7 +538,10 @@ void VariationsService::EnsureLocaleEquals(const std::string& locale) {
+   // Uses a CHECK rather than a DCHECK to ensure that issues are caught since
+   // problems in this area may only appear in the wild due to official builds
+   // and end user machines.
+-  if (locale != field_trial_creator_.application_locale()) {
++  // Skip check if GeoIP is active (locale override is expected)
++  bool geoip_active = base::CommandLine::ForCurrentProcess()->HasSwitch("geoip");
++
++  if (locale != field_trial_creator_.application_locale() && !geoip_active) {
+     // TODO(crbug.com/41430274): Report the two values in crash keys.
+     static auto* lhs_key = base::debug::AllocateCrashKeyString(
+         "mismatched_locale_lhs", base::debug::CrashKeySize::Size256);
+diff --git a/content/browser/browser_main_loop.cc b/content/browser/browser_main_loop.cc
+index 2b22de8de64b7..a12778247beab 100644
+--- a/content/browser/browser_main_loop.cc
++++ b/content/browser/browser_main_loop.cc
+@@ -73,7 +73,6 @@
+ #include "content/browser/child_process_security_policy_impl.h"
+ #include "content/browser/compositor/viz_process_transport_factory.h"
+ #include "content/browser/download/save_file_manager.h"
+-#include "content/browser/geoip/geoip_initializer.h"
+ #include "content/browser/field_trial_synchronizer.h"
+ #include "content/browser/first_party_sets/first_party_set_parser.h"
+ #include "content/browser/first_party_sets/first_party_sets_handler_impl.h"
+@@ -999,11 +998,6 @@ int BrowserMainLoop::PostCreateThreads() {
+ 
+ int BrowserMainLoop::PreMainMessageLoopRun() {
+   TRACE_EVENT0("startup", "BrowserMainLoop::PreMainMessageLoopRun");
+-  // Initialize GeoIP if --geoip flag is present
+-  if (!InitializeGeoIPIfNeeded(&*parsed_command_line_)) {
+-    LOG(ERROR) << "Err! Connection timed out!";
+-    return 1;
+-  }
+ 
+   auto font_render_params =
+       gfx::GetFontRenderParams(gfx::FontRenderParamsQuery(), nullptr);
+diff --git a/content/browser/geoip/BUILD.gn b/content/browser/geoip/BUILD.gn
+index f8f55945151a0..17fdeda6b85c6 100644
+--- a/content/browser/geoip/BUILD.gn
++++ b/content/browser/geoip/BUILD.gn
+@@ -16,7 +16,6 @@ source_set("geoip") {
+ 
+   deps = [
+     "//base",
+-    "//content/common",
+     "//net",
+     "//services/network/public/cpp",
+     "//services/network/public/mojom",
+diff --git a/content/browser/geoip/geoip_initializer.cc b/content/browser/geoip/geoip_initializer.cc
+index 6fb62ef8bebb4..2b49de65e0562 100644
+--- a/content/browser/geoip/geoip_initializer.cc
++++ b/content/browser/geoip/geoip_initializer.cc
+@@ -6,7 +6,6 @@
+ 
+ #include "base/command_line.h"
+ #include "base/logging.h"
+-#include "content/public/common/content_switches.h"
+ #include "content/browser/geoip/geoip_manager.h"
+ #include "content/browser/geoip/simple_http_client.h"
+ #include "third_party/icu/source/i18n/unicode/timezone.h"
+@@ -23,7 +22,7 @@ bool g_geo_initialized = false;
+ }  // namespace
+ 
+ bool InitializeGeoIPIfNeeded(const base::CommandLine* command_line) {
+-  if (!command_line->HasSwitch(switches::kGeoIP)) {
++  if (!command_line->HasSwitch("geoip")) {
+     return true;  // Not using GeoIP, proceed normally
+   }
+ 
+@@ -71,11 +70,18 @@ bool InitializeGeoIPIfNeeded(const base::CommandLine* command_line) {
+   icu::TimeZone* tz = icu::TimeZone::createTimeZone(
+       icu::UnicodeString::fromUTF8(g_geo_data->timezone));
+   icu::TimeZone::adoptDefault(tz);
+-  // Set ICU locale globally for Intl API and navigator.language
++
++  // Set ICU locale globally for Intl API
+   UErrorCode status = U_ZERO_ERROR;
+   icu::Locale new_locale(g_geo_data->locale.c_str());
+   icu::Locale::setDefault(new_locale, status);
+ 
++  if (U_FAILURE(status)) {
++    LOG(ERROR) << "Failed to set ICU locale: " << u_errorName(status);
++  } else {
++    LOG(INFO) << "ICU locale set to: " << icu::Locale::getDefault().getName();
++  }
++
+   LOG(INFO) << "GeoIP initialized successfully:";
+   LOG(INFO) << "  Timezone: " << g_geo_data->timezone;
+   LOG(INFO) << "  Locale: " << g_geo_data->locale;
+@@ -100,4 +106,18 @@ bool IsGeoIPInitialized() {
+   return g_geo_initialized;
+ }
+ 
++std::string GetGeoIPLocale() {
++  if (g_geo_initialized && g_geo_data) {
++    std::string full_locale = g_geo_data->locale;
++    // Add both full locale (ja-JP) and short form (ja) for CreepJS compatibility
++    size_t dash_pos = full_locale.find('-');
++    if (dash_pos != std::string::npos) {
++      std::string short_locale = full_locale.substr(0, dash_pos);
++      return full_locale + "," + short_locale;
++    }
++    return full_locale;
++  }
++  return std::string();
++}
++
+ }  // namespace content
+diff --git a/content/browser/geoip/geoip_initializer.h b/content/browser/geoip/geoip_initializer.h
+index f4b4a72ba7f7f..166a2ac73409a 100644
+--- a/content/browser/geoip/geoip_initializer.h
++++ b/content/browser/geoip/geoip_initializer.h
+@@ -5,7 +5,7 @@
+ #ifndef CONTENT_BROWSER_GEOIP_GEOIP_INITIALIZER_H_
+ #define CONTENT_BROWSER_GEOIP_GEOIP_INITIALIZER_H_
+ 
+-#include "content/common/content_export.h"
++#include <string>
+ 
+ namespace base {
+ class CommandLine;
+@@ -20,6 +20,9 @@ bool InitializeGeoIPIfNeeded(const base::CommandLine* command_line);
+ // Cleanup GeoIP resources
+ void ShutdownGeoIP();
+ 
++// Returns the GeoIP-based locale if initialized, empty string otherwise
++std::string GetGeoIPLocale();
++
+ }  // namespace content
+ 
+ #endif  // CONTENT_BROWSER_GEOIP_GEOIP_INITIALIZER_H_
+diff --git a/content/browser/geoip/geoip_manager.h b/content/browser/geoip/geoip_manager.h
+index ddbfd557b10a2..21635894c9cb1 100644
+--- a/content/browser/geoip/geoip_manager.h
++++ b/content/browser/geoip/geoip_manager.h
+@@ -7,7 +7,6 @@
+ 
+ #include <string>
+ #include "base/files/file_path.h"
+-#include "content/common/content_export.h"
+ 
+ namespace content {
+ 
+diff --git a/content/browser/geoip/ip_fetcher.h b/content/browser/geoip/ip_fetcher.h
+index 6bd303aef8695..3484c5eaf3415 100644
+--- a/content/browser/geoip/ip_fetcher.h
++++ b/content/browser/geoip/ip_fetcher.h
+@@ -10,7 +10,6 @@
+ 
+ #include "base/functional/callback.h"
+ #include "base/memory/scoped_refptr.h"
+-#include "content/common/content_export.h"
+ 
+ namespace network {
+ class SharedURLLoaderFactory;
+diff --git a/content/browser/geoip/simple_http_client.h b/content/browser/geoip/simple_http_client.h
+index 1ff55c583c02c..afc454479c00b 100644
+--- a/content/browser/geoip/simple_http_client.h
++++ b/content/browser/geoip/simple_http_client.h
+@@ -6,7 +6,6 @@
+ #define CONTENT_BROWSER_GEOIP_SIMPLE_HTTP_CLIENT_H_
+ 
+ #include <string>
+-#include "content/common/content_export.h"
+ 
+ namespace content {
+ 
+diff --git a/content/browser/renderer_host/render_process_host_impl.cc b/content/browser/renderer_host/render_process_host_impl.cc
+index 3a042e5ef423d..9fb7ea3a11506 100644
+--- a/content/browser/renderer_host/render_process_host_impl.cc
++++ b/content/browser/renderer_host/render_process_host_impl.cc
+@@ -102,6 +102,7 @@
+ #include "content/browser/field_trial_synchronizer.h"
+ #include "content/browser/file_system/file_system_manager_impl.h"
+ #include "content/browser/file_system_access/file_system_access_manager_impl.h"
++#include "content/browser/geoip/geoip_initializer.h"
+ #include "content/browser/gpu/browser_gpu_client_delegate.h"
+ #include "content/browser/gpu/compositor_util.h"
+ #include "content/browser/gpu/gpu_data_manager_impl.h"
+@@ -3561,8 +3562,17 @@ void RenderProcessHostImpl::AppendRendererCommandLine(
+   PropagateBrowserCommandLineToRenderer(browser_command_line, command_line);
+ 
+   // Pass on the browser locale.
+-  const std::string locale =
+-      GetContentClient()->browser()->GetApplicationLocale();
++  // Override with GeoIP locale if initialized
++  std::string locale = GetGeoIPLocale();
++  if (!locale.empty()) {
++    // GetGeoIPLocale returns "ja-JP,ja" - take only first for --lang flag
++    size_t comma_pos = locale.find(',');
++    if (comma_pos != std::string::npos) {
++      locale = locale.substr(0, comma_pos);
++    }
++  } else {
++    locale = GetContentClient()->browser()->GetApplicationLocale();
++  }
+   command_line->AppendSwitchASCII(switches::kLang, locale);
+ 
+   // A non-empty RendererCmdPrefix implies that Zygote is disabled.
