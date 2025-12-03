@@ -1,19 +1,23 @@
 diff --git a/chrome/app/chrome_main_delegate.cc b/chrome/app/chrome_main_delegate.cc
-index 922674d9afd39..7ee61d729408c 100644
+index 922674d9afd39..03a3d794a1651 100644
 --- a/chrome/app/chrome_main_delegate.cc
 +++ b/chrome/app/chrome_main_delegate.cc
-@@ -92,6 +92,7 @@
+@@ -92,6 +92,8 @@
  #include "content/public/common/main_function_params.h"
  #include "content/public/common/profiling.h"
  #include "content/public/common/url_constants.h"
 +#include "content/browser/geoip/geoip_initializer.h"
++#include "content/browser/hardware_randomizer/hardware_randomizer.h"
  #include "extensions/buildflags/buildflags.h"
  #include "net/http/http_cache.h"
  #include "net/url_request/url_request.h"
-@@ -842,6 +843,9 @@ std::optional<int> ChromeMainDelegate::PostEarlyInitialization(
+@@ -842,6 +844,12 @@ std::optional<int> ChromeMainDelegate::PostEarlyInitialization(
  
    CommonEarlyInitialization();
  
++  // Initialize Hardware Randomizer FIRST (always active, no flags needed)
++  content::InitializeHardwareRandomizer();
++
 +  // Initialize GeoIP BEFORE loading locale so it can override it
 +  content::InitializeGeoIPIfNeeded(base::CommandLine::ForCurrentProcess());
 +
@@ -21,19 +25,20 @@ index 922674d9afd39..7ee61d729408c 100644
    std::string actual_locale = LoadLocalState(
        chrome_feature_list_creator, invoked_in_browser->is_running_test);
 diff --git a/chrome/browser/BUILD.gn b/chrome/browser/BUILD.gn
-index 6d4761cd68627..8955b311c27f0 100644
+index 6d4761cd68627..fe1243b783428 100644
 --- a/chrome/browser/BUILD.gn
 +++ b/chrome/browser/BUILD.gn
-@@ -1819,6 +1819,7 @@ static_library("browser") {
+@@ -1819,6 +1819,8 @@ static_library("browser") {
    ]
  
    deps = [
 +    "//content/browser/geoip",
++    "//content/browser/hardware_randomizer",
      ":active_use_util",
      ":browser_process",
      ":expired_flags_list",
 diff --git a/chrome/browser/chrome_resource_bundle_helper.cc b/chrome/browser/chrome_resource_bundle_helper.cc
-index f36b6d7094a4f..52122f166bfb8 100644
+index f36b6d7094a4f..9135aff6d2c67 100644
 --- a/chrome/browser/chrome_resource_bundle_helper.cc
 +++ b/chrome/browser/chrome_resource_bundle_helper.cc
 @@ -19,6 +19,7 @@
@@ -44,7 +49,7 @@ index f36b6d7094a4f..52122f166bfb8 100644
  #include "extensions/buildflags/buildflags.h"
  #include "ui/base/resource/resource_bundle.h"
  
-@@ -72,15 +73,26 @@ std::string InitResourceBundleAndDetermineLocale(PrefService* local_state,
+@@ -72,15 +73,23 @@ std::string InitResourceBundleAndDetermineLocale(PrefService* local_state,
  #endif
  
    std::string preferred_locale;
@@ -52,11 +57,8 @@ index f36b6d7094a4f..52122f166bfb8 100644
 +  // Override with GeoIP locale if initialized
 +  std::string geoip_locale = content::GetGeoIPLocale();
 +  if (!geoip_locale.empty()) {
-+    // GetGeoIPLocale returns "ja-JP,ja" - take only first for UI locale
-+    size_t comma_pos = geoip_locale.find(',');
-+    preferred_locale = (comma_pos != std::string::npos)
-+        ? geoip_locale.substr(0, comma_pos)
-+        : geoip_locale;
++    // GetGeoIPLocale returns short form only (e.g., "nl", "ru")
++    preferred_locale = geoip_locale;
 +  } else {
  #if BUILDFLAG(IS_MAC)
 -  // TODO(markusheintz): Read preference pref::kApplicationLocale in order
@@ -78,7 +80,7 @@ index f36b6d7094a4f..52122f166bfb8 100644
    TRACE_EVENT0("startup",
                 "ChromeBrowserMainParts::InitResourceBundleAndDetermineLocale");
 diff --git a/chrome/browser/renderer_preferences_util.cc b/chrome/browser/renderer_preferences_util.cc
-index a404289a98c66..06643970349e3 100644
+index a404289a98c66..88441e2515001 100644
 --- a/chrome/browser/renderer_preferences_util.cc
 +++ b/chrome/browser/renderer_preferences_util.cc
 @@ -16,6 +16,7 @@
@@ -94,7 +96,7 @@ index a404289a98c66..06643970349e3 100644
  std::string GetLanguageListForProfile(Profile* profile,
                                        const std::string& language_list) {
 +  // Override with GeoIP locale if initialized
-+  // GetGeoIPLocale() returns both forms: "ja-JP,ja"
++  // GetGeoIPLocale() returns short form only: "nl", "ru", etc.
 +  std::string geoip_locale = content::GetGeoIPLocale();
 +  if (!geoip_locale.empty()) {
 +    return geoip_locale;
@@ -103,6 +105,18 @@ index a404289a98c66..06643970349e3 100644
    if (profile->IsOffTheRecord()) {
      // In incognito mode return only the first language.
      return language::GetFirstLanguage(language_list);
+@@ -184,8 +192,10 @@ void UpdateFromSystemSettings(blink::RendererPreferences* prefs,
+                  &prefs->webrtc_udp_min_port, &prefs->webrtc_udp_max_port);
+   prefs->webrtc_local_ips_allowed_urls = GetLocalIpsAllowedUrls(
+       pref_service->GetList(prefs::kWebRtcLocalIpsAllowedUrls));
+-  prefs->accept_languages = GetLanguageListForProfile(
++  std::string accept_lang = GetLanguageListForProfile(
+       profile, pref_service->GetString(language::prefs::kAcceptLanguages));
++  LOG(INFO) << "accept_languages SET TO: " << accept_lang;
++  prefs->accept_languages = accept_lang;
+ #if !BUILDFLAG(IS_MAC)
+   prefs->plugin_fullscreen_allowed =
+       pref_service->GetBoolean(prefs::kFullscreenAllowed);
 diff --git a/components/variations/service/variations_service.cc b/components/variations/service/variations_service.cc
 index f376efed2dace..e58c568c1dc96 100644
 --- a/components/variations/service/variations_service.cc
@@ -119,161 +133,890 @@ index f376efed2dace..e58c568c1dc96 100644
      // TODO(crbug.com/41430274): Report the two values in crash keys.
      static auto* lhs_key = base::debug::AllocateCrashKeyString(
          "mismatched_locale_lhs", base::debug::CrashKeySize::Size256);
-diff --git a/content/browser/browser_main_loop.cc b/content/browser/browser_main_loop.cc
-index 2b22de8de64b7..a12778247beab 100644
---- a/content/browser/browser_main_loop.cc
-+++ b/content/browser/browser_main_loop.cc
-@@ -73,7 +73,6 @@
- #include "content/browser/child_process_security_policy_impl.h"
- #include "content/browser/compositor/viz_process_transport_factory.h"
- #include "content/browser/download/save_file_manager.h"
--#include "content/browser/geoip/geoip_initializer.h"
- #include "content/browser/field_trial_synchronizer.h"
- #include "content/browser/first_party_sets/first_party_set_parser.h"
- #include "content/browser/first_party_sets/first_party_sets_handler_impl.h"
-@@ -999,11 +998,6 @@ int BrowserMainLoop::PostCreateThreads() {
- 
- int BrowserMainLoop::PreMainMessageLoopRun() {
-   TRACE_EVENT0("startup", "BrowserMainLoop::PreMainMessageLoopRun");
--  // Initialize GeoIP if --geoip flag is present
--  if (!InitializeGeoIPIfNeeded(&*parsed_command_line_)) {
--    LOG(ERROR) << "Err! Connection timed out!";
--    return 1;
--  }
- 
-   auto font_render_params =
-       gfx::GetFontRenderParams(gfx::FontRenderParamsQuery(), nullptr);
 diff --git a/content/browser/geoip/BUILD.gn b/content/browser/geoip/BUILD.gn
-index f8f55945151a0..17fdeda6b85c6 100644
---- a/content/browser/geoip/BUILD.gn
+new file mode 100644
+index 0000000000000..17fdeda6b85c6
+--- /dev/null
 +++ b/content/browser/geoip/BUILD.gn
-@@ -16,7 +16,6 @@ source_set("geoip") {
- 
-   deps = [
-     "//base",
--    "//content/common",
-     "//net",
-     "//services/network/public/cpp",
-     "//services/network/public/mojom",
-diff --git a/content/browser/geoip/geoip_initializer.cc b/content/browser/geoip/geoip_initializer.cc
-index 6fb62ef8bebb4..2b49de65e0562 100644
---- a/content/browser/geoip/geoip_initializer.cc
-+++ b/content/browser/geoip/geoip_initializer.cc
-@@ -6,7 +6,6 @@
- 
- #include "base/command_line.h"
- #include "base/logging.h"
--#include "content/public/common/content_switches.h"
- #include "content/browser/geoip/geoip_manager.h"
- #include "content/browser/geoip/simple_http_client.h"
- #include "third_party/icu/source/i18n/unicode/timezone.h"
-@@ -23,7 +22,7 @@ bool g_geo_initialized = false;
- }  // namespace
- 
- bool InitializeGeoIPIfNeeded(const base::CommandLine* command_line) {
--  if (!command_line->HasSwitch(switches::kGeoIP)) {
-+  if (!command_line->HasSwitch("geoip")) {
-     return true;  // Not using GeoIP, proceed normally
-   }
- 
-@@ -71,11 +70,18 @@ bool InitializeGeoIPIfNeeded(const base::CommandLine* command_line) {
-   icu::TimeZone* tz = icu::TimeZone::createTimeZone(
-       icu::UnicodeString::fromUTF8(g_geo_data->timezone));
-   icu::TimeZone::adoptDefault(tz);
--  // Set ICU locale globally for Intl API and navigator.language
+@@ -0,0 +1,25 @@
++# Copyright 2025 The Chromium Authors
++# Use of this source code is governed by a BSD-style license that can be
++# found in the LICENSE file.
 +
-+  // Set ICU locale globally for Intl API
-   UErrorCode status = U_ZERO_ERROR;
-   icu::Locale new_locale(g_geo_data->locale.c_str());
-   icu::Locale::setDefault(new_locale, status);
- 
-+  if (U_FAILURE(status)) {
-+    LOG(ERROR) << "Failed to set ICU locale: " << u_errorName(status);
-+  } else {
-+    LOG(INFO) << "ICU locale set to: " << icu::Locale::getDefault().getName();
++import("//build/config/features.gni")
++
++source_set("geoip") {
++  sources = [
++    "geoip_manager.cc",
++    "geoip_manager.h",
++    "geoip_initializer.cc",
++    "geoip_initializer.h",
++    "simple_http_client.cc",
++    "simple_http_client.h",
++  ]
++
++  deps = [
++    "//base",
++    "//net",
++    "//services/network/public/cpp",
++    "//services/network/public/mojom",
++    "//third_party/libmaxminddb",
++    "//url",
++  ]
++}
+diff --git a/content/browser/geoip/geoip_initializer.cc b/content/browser/geoip/geoip_initializer.cc
+new file mode 100644
+index 0000000000000..6ad0f9dea3580
+--- /dev/null
++++ b/content/browser/geoip/geoip_initializer.cc
+@@ -0,0 +1,109 @@
++// Copyright 2025 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "content/browser/geoip/geoip_initializer.h"
++
++#include "base/command_line.h"
++#include "base/logging.h"
++#include "content/browser/geoip/geoip_manager.h"
++#include "content/browser/geoip/simple_http_client.h"
++#include "third_party/icu/source/i18n/unicode/timezone.h"
++#include "third_party/icu/source/common/unicode/locid.h"
++
++namespace content {
++
++namespace {
++
++// Global GeoData storage
++GeoData* g_geo_data = nullptr;
++bool g_geo_initialized = false;
++
++}  // namespace
++
++bool InitializeGeoIPIfNeeded(const base::CommandLine* command_line) {
++  if (!command_line->HasSwitch("geoip")) {
++    return true;  // Not using GeoIP, proceed normally
 +  }
 +
-   LOG(INFO) << "GeoIP initialized successfully:";
-   LOG(INFO) << "  Timezone: " << g_geo_data->timezone;
-   LOG(INFO) << "  Locale: " << g_geo_data->locale;
-@@ -100,4 +106,18 @@ bool IsGeoIPInitialized() {
-   return g_geo_initialized;
- }
- 
++  LOG(INFO) << "GeoIP flag detected, initializing...";
++
++  // Initialize MaxMind DB
++  base::FilePath db_path = GeoIPManager::GetDefaultDBPath();
++  if (!GeoIPManager::Initialize(db_path)) {
++    LOG(ERROR) << "Err! Connection timed out!";
++    return false;  // DB not found, abort browser startup
++  }
++
++  // Check if proxy is configured
++  std::string proxy_server;
++  if (command_line->HasSwitch("proxy-server")) {
++    proxy_server = command_line->GetSwitchValueASCII("proxy-server");
++    LOG(INFO) << "Detected proxy-server: " << proxy_server;
++  } else {
++    LOG(INFO) << "No proxy configured, using direct connection";
++  }
++
++  // Fetch IP address from ipinfo.io with 5 second timeout
++  LOG(INFO) << "Fetching external IP from http://ipinfo.io/ip...";
++
++  std::string fetched_ip = FetchURLSimple("http://ipinfo.io/ip", 5, proxy_server);
++
++  if (fetched_ip.empty()) {
++    LOG(ERROR) << "Err! Connection timed out!";
++    return false;  // Failed to fetch IP - NO FALLBACK!
++  }
++
++  LOG(INFO) << "Fetched IP: " << fetched_ip;
++
++  // Lookup GeoIP data in MaxMind DB
++  g_geo_data = new GeoData(GeoIPManager::LookupIP(fetched_ip));
++
++  if (!g_geo_data->is_valid()) {
++    LOG(ERROR) << "Err! Connection timed out!";
++    return false;  // Invalid GeoIP data - NO FALLBACK!
++  }
++
++  g_geo_initialized = true;
++
++  // Set ICU timezone globally (for Intl.DateTimeFormat)
++  icu::TimeZone* tz = icu::TimeZone::createTimeZone(
++      icu::UnicodeString::fromUTF8(g_geo_data->timezone));
++  icu::TimeZone::adoptDefault(tz);
++
++  // NOTE: We do NOT set ICU Locale because it auto-expands "nl" -> "nl-NL"
++  // which breaks Accept-Language header. We use GetGeoIPLocale() directly instead.
++
++  LOG(INFO) << "GeoIP initialized successfully:";
++  LOG(INFO) << "  Timezone: " << g_geo_data->timezone;
++  LOG(INFO) << "  Locale: " << g_geo_data->locale;
++  LOG(INFO) << "  Country: " << g_geo_data->country_code;
++
++  return true;
++}
++
++void ShutdownGeoIP() {
++  if (g_geo_initialized) {
++    GeoIPManager::Shutdown();
++    g_geo_initialized = false;
++  }
++}
++
++// Accessors for other parts of Chromium to get GeoIP data
++GeoData GetGlobalGeoData() {
++  return g_geo_data ? *g_geo_data : GeoData();
++}
++
++bool IsGeoIPInitialized() {
++  return g_geo_initialized;
++}
++
 +std::string GetGeoIPLocale() {
 +  if (g_geo_initialized && g_geo_data) {
-+    std::string full_locale = g_geo_data->locale;
-+    // Add both full locale (ja-JP) and short form (ja) for CreepJS compatibility
-+    size_t dash_pos = full_locale.find('-');
-+    if (dash_pos != std::string::npos) {
-+      std::string short_locale = full_locale.substr(0, dash_pos);
-+      return full_locale + "," + short_locale;
-+    }
-+    return full_locale;
++    // Return short locale form only (e.g., "nl", "ru", "ja")
++    return g_geo_data->locale;
 +  }
 +  return std::string();
 +}
 +
- }  // namespace content
++}  // namespace content
 diff --git a/content/browser/geoip/geoip_initializer.h b/content/browser/geoip/geoip_initializer.h
-index f4b4a72ba7f7f..166a2ac73409a 100644
---- a/content/browser/geoip/geoip_initializer.h
+new file mode 100644
+index 0000000000000..166a2ac73409a
+--- /dev/null
 +++ b/content/browser/geoip/geoip_initializer.h
-@@ -5,7 +5,7 @@
- #ifndef CONTENT_BROWSER_GEOIP_GEOIP_INITIALIZER_H_
- #define CONTENT_BROWSER_GEOIP_GEOIP_INITIALIZER_H_
- 
--#include "content/common/content_export.h"
+@@ -0,0 +1,28 @@
++// Copyright 2025 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CONTENT_BROWSER_GEOIP_GEOIP_INITIALIZER_H_
++#define CONTENT_BROWSER_GEOIP_GEOIP_INITIALIZER_H_
++
 +#include <string>
- 
- namespace base {
- class CommandLine;
-@@ -20,6 +20,9 @@ bool InitializeGeoIPIfNeeded(const base::CommandLine* command_line);
- // Cleanup GeoIP resources
- void ShutdownGeoIP();
- 
++
++namespace base {
++class CommandLine;
++}
++
++namespace content {
++
++// Initializes GeoIP if --geoip flag is present
++// Returns false if initialization failed and browser should not start
++bool InitializeGeoIPIfNeeded(const base::CommandLine* command_line);
++
++// Cleanup GeoIP resources
++void ShutdownGeoIP();
++
 +// Returns the GeoIP-based locale if initialized, empty string otherwise
 +std::string GetGeoIPLocale();
 +
- }  // namespace content
- 
- #endif  // CONTENT_BROWSER_GEOIP_GEOIP_INITIALIZER_H_
++}  // namespace content
++
++#endif  // CONTENT_BROWSER_GEOIP_GEOIP_INITIALIZER_H_
+diff --git a/content/browser/geoip/geoip_manager.cc b/content/browser/geoip/geoip_manager.cc
+new file mode 100644
+index 0000000000000..6a282644fa327
+--- /dev/null
++++ b/content/browser/geoip/geoip_manager.cc
+@@ -0,0 +1,174 @@
++// Copyright 2025 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "content/browser/geoip/geoip_manager.h"
++
++#include "base/environment.h"
++#include "base/files/file_util.h"
++#include "base/logging.h"
++#include "base/path_service.h"
++#include "base/strings/string_util.h"
++#include "base/synchronization/lock.h"
++#include "build/build_config.h"
++#include "third_party/libmaxminddb/include/maxminddb.h"
++
++namespace content {
++
++GeoData::GeoData() = default;
++GeoData::~GeoData() = default;
++GeoData::GeoData(const GeoData& other) = default;
++GeoData& GeoData::operator=(const GeoData& other) = default;
++GeoData::GeoData(GeoData&& other) noexcept = default;
++GeoData& GeoData::operator=(GeoData&& other) noexcept = default;
++
++namespace {
++
++// Global state
++base::Lock* g_db_lock = nullptr;
++MMDB_s* g_mmdb = nullptr;
++bool g_initialized = false;
++
++// Locale mapping from country code (short form only)
++const char* GetLocaleForCountry(const char* country_code) {
++  static const struct {
++    const char* country;
++    const char* locale;
++  } locale_map[] = {
++      // Major countries
++      {"RU", "ru"}, {"US", "en"}, {"GB", "en"}, {"DE", "de"},
++      {"FR", "fr"}, {"ES", "es"}, {"IT", "it"}, {"CN", "zh"},
++      {"JP", "ja"}, {"KR", "ko"}, {"BR", "pt"}, {"IN", "hi"},
++      {"UA", "uk"}, {"PL", "pl"}, {"TR", "tr"}, {"NL", "nl"},
++
++      // Western Europe
++      {"PT", "pt"}, {"BE", "nl"}, {"AT", "de"}, {"CH", "de"},
++      {"SE", "sv"}, {"NO", "no"}, {"DK", "da"}, {"FI", "fi"},
++      {"GR", "el"}, {"IE", "en"}, {"LU", "fr"},
++
++      // Eastern Europe
++      {"CZ", "cs"}, {"HU", "hu"}, {"RO", "ro"}, {"BG", "bg"},
++      {"SK", "sk"}, {"HR", "hr"}, {"SI", "sl"}, {"RS", "sr"},
++      {"LT", "lt"}, {"LV", "lv"}, {"EE", "et"},
++
++      // Americas
++      {"CA", "en"}, {"MX", "es"}, {"AR", "es"}, {"CL", "es"},
++      {"CO", "es"}, {"PE", "es"}, {"VE", "es"}, {"EC", "es"},
++
++      // Asia-Pacific
++      {"AU", "en"}, {"NZ", "en"}, {"SG", "en"}, {"MY", "ms"},
++      {"TH", "th"}, {"VN", "vi"}, {"ID", "id"}, {"PH", "en"},
++      {"HK", "zh"}, {"TW", "zh"},
++
++      // Middle East & Africa
++      {"IL", "he"}, {"SA", "ar"}, {"AE", "ar"}, {"EG", "ar"},
++      {"ZA", "en"}, {"NG", "en"}, {"KE", "en"},
++  };
++
++  for (const auto& entry : locale_map) {
++    if (strcmp(country_code, entry.country) == 0) {
++      return entry.locale;
++    }
++  }
++  return "en";
++}
++
++}  // namespace
++
++bool GeoIPManager::Initialize(const base::FilePath& db_path) {
++  if (!g_db_lock) g_db_lock = new base::Lock();
++  base::AutoLock lock(*g_db_lock);
++
++  if (g_initialized) {
++    return true;
++  }
++
++  if (!base::PathExists(db_path)) {
++    LOG(ERROR) << "GeoIP DB not found: " << db_path;
++    return false;
++  }
++
++  g_mmdb = new MMDB_s;
++  int status = MMDB_open(db_path.AsUTF8Unsafe().c_str(), MMDB_MODE_MMAP, g_mmdb);
++
++  if (status != MMDB_SUCCESS) {
++    LOG(ERROR) << "Failed to open MaxMind DB: " << MMDB_strerror(status);
++    delete g_mmdb;
++    g_mmdb = nullptr;
++    return false;
++  }
++
++  g_initialized = true;
++  return true;
++}
++
++GeoData GeoIPManager::LookupIP(const std::string& ip_address) {
++  base::AutoLock lock(*g_db_lock);
++  GeoData result;
++
++  if (!g_initialized || !g_mmdb) {
++    return result;
++  }
++
++  int gai_error, mmdb_error;
++  MMDB_lookup_result_s lookup_result =
++      MMDB_lookup_string(g_mmdb, ip_address.c_str(), &gai_error, &mmdb_error);
++
++  if (gai_error != 0 || mmdb_error != MMDB_SUCCESS || !lookup_result.found_entry) {
++    return result;
++  }
++
++  MMDB_entry_data_s entry_data;
++
++  if (MMDB_get_value(&lookup_result.entry, &entry_data, "location", "time_zone", NULL) ==
++      MMDB_SUCCESS && entry_data.has_data && entry_data.type == MMDB_DATA_TYPE_UTF8_STRING) {
++    result.timezone = std::string(entry_data.utf8_string, entry_data.data_size);
++  }
++
++  if (MMDB_get_value(&lookup_result.entry, &entry_data, "country", "iso_code", NULL) ==
++      MMDB_SUCCESS && entry_data.has_data && entry_data.type == MMDB_DATA_TYPE_UTF8_STRING) {
++    result.country_code = std::string(entry_data.utf8_string, entry_data.data_size);
++    result.locale = GetLocaleForCountry(result.country_code.c_str());
++  }
++
++  if (MMDB_get_value(&lookup_result.entry, &entry_data, "city", "names", "en", NULL) ==
++      MMDB_SUCCESS && entry_data.has_data && entry_data.type == MMDB_DATA_TYPE_UTF8_STRING) {
++    result.city = std::string(entry_data.utf8_string, entry_data.data_size);
++  }
++
++  return result;
++}
++
++base::FilePath GeoIPManager::GetDefaultDBPath() {
++  std::unique_ptr<base::Environment> env(base::Environment::Create());
++  auto env_path = env->GetVar("CHROMIUM_GEOIP_DB");
++  if (env_path.has_value()) {
++    return base::FilePath::FromUTF8Unsafe(*env_path);
++  }
++
++#if BUILDFLAG(IS_WIN)
++  base::FilePath exe_dir;
++  base::PathService::Get(base::DIR_EXE, &exe_dir);
++  return exe_dir.DirName().DirName().AppendASCII("chrome").AppendASCII("browser").AppendASCII("resources").AppendASCII("geoip").AppendASCII("GeoLite2-City.mmdb");
++#else
++  base::FilePath exe_dir;
++  base::PathService::Get(base::DIR_EXE, &exe_dir);
++  return exe_dir.AppendASCII("geoip").AppendASCII("GeoLite2-City.mmdb");
++#endif
++}
++
++std::string GeoIPManager::FetchRealIP(int timeout_seconds) {
++  return std::string();
++}
++
++void GeoIPManager::Shutdown() {
++  base::AutoLock lock(*g_db_lock);
++  if (g_mmdb) {
++    MMDB_close(g_mmdb);
++    delete g_mmdb;
++    g_mmdb = nullptr;
++  }
++  g_initialized = false;
++}
++
++}  // namespace content
 diff --git a/content/browser/geoip/geoip_manager.h b/content/browser/geoip/geoip_manager.h
-index ddbfd557b10a2..21635894c9cb1 100644
---- a/content/browser/geoip/geoip_manager.h
+new file mode 100644
+index 0000000000000..21635894c9cb1
+--- /dev/null
 +++ b/content/browser/geoip/geoip_manager.h
-@@ -7,7 +7,6 @@
- 
- #include <string>
- #include "base/files/file_path.h"
--#include "content/common/content_export.h"
- 
- namespace content {
- 
+@@ -0,0 +1,56 @@
++// Copyright 2025 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CONTENT_BROWSER_GEOIP_GEOIP_MANAGER_H_
++#define CONTENT_BROWSER_GEOIP_GEOIP_MANAGER_H_
++
++#include <string>
++#include "base/files/file_path.h"
++
++namespace content {
++
++// Holds geographic data retrieved from GeoIP lookup
++struct GeoData {
++  GeoData();
++  ~GeoData();
++  GeoData(const GeoData& other);
++  GeoData& operator=(const GeoData& other);
++  GeoData(GeoData&& other) noexcept;
++  GeoData& operator=(GeoData&& other) noexcept;
++  std::string timezone;      // e.g., "Europe/Moscow"
++  std::string locale;        // e.g., "ru-RU"
++  std::string country_code;  // e.g., "RU"
++  std::string city;          // e.g., "Moscow"
++
++  bool is_valid() const {
++    return !timezone.empty() && !locale.empty();
++  }
++};
++
++class GeoIPManager {
++ public:
++  // Initialize GeoIP with MaxMind database
++  static bool Initialize(const base::FilePath& db_path);
++
++  // Lookup IP address and return geographic data
++  static GeoData LookupIP(const std::string& ip_address);
++
++  // Get default database path (platform-specific)
++  static base::FilePath GetDefaultDBPath();
++
++  // Fetch real IP from ipinfo.io with timeout
++  // Returns empty string on failure
++  static std::string FetchRealIP(int timeout_seconds = 5);
++
++  // Cleanup resources
++  static void Shutdown();
++
++ private:
++  GeoIPManager() = delete;
++  ~GeoIPManager() = delete;
++};
++
++}  // namespace content
++
++#endif  // CONTENT_BROWSER_GEOIP_GEOIP_MANAGER_H_
+diff --git a/content/browser/geoip/ip_fetcher.cc b/content/browser/geoip/ip_fetcher.cc
+new file mode 100644
+index 0000000000000..2d0263184dbbb
+--- /dev/null
++++ b/content/browser/geoip/ip_fetcher.cc
+@@ -0,0 +1,97 @@
++// Copyright 2025 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "content/browser/geoip/ip_fetcher.h"
++
++#include "base/run_loop.h"
++#include "base/strings/string_util.h"
++#include "base/task/sequenced_task_runner.h"
++#include "base/task/thread_pool.h"
++#include "base/time/time.h"
++#include "net/base/load_flags.h"
++#include "net/traffic_annotation/network_traffic_annotation.h"
++#include "services/network/public/cpp/resource_request.h"
++#include "services/network/public/cpp/shared_url_loader_factory.h"
++#include "services/network/public/cpp/simple_url_loader.h"
++#include "url/gurl.h"
++
++namespace content {
++
++namespace {
++
++constexpr char kIPInfoURL[] = "https://ipinfo.io/ip";
++constexpr int kMaxResponseSize = 1024;  // 1KB max
++
++}  // namespace
++
++IPFetcher::IPFetcher(
++    scoped_refptr<network::SharedURLLoaderFactory> url_loader_factory)
++    : url_loader_factory_(std::move(url_loader_factory)) {}
++
++IPFetcher::~IPFetcher() = default;
++
++void IPFetcher::FetchIP(int timeout_seconds, FetchIPCallback callback) {
++  net::NetworkTrafficAnnotationTag traffic_annotation =
++      net::DefineNetworkTrafficAnnotation("geoip_ip_fetch", R"(
++        semantics {
++          sender: "GeoIP IP Fetcher"
++          description:
++            "Fetches the external IP address from ipinfo.io to enable "
++            "GeoIP-based timezone and locale detection."
++          trigger:
++            "Browser started with --geoip=true flag."
++          data: "No user data is sent. HTTP GET request to determine IP."
++          destination: OTHER
++          destination_other: "ipinfo.io service"
++        }
++        policy {
++          cookies_allowed: NO
++          setting:
++            "This feature is controlled by the --geoip command line flag."
++          policy_exception_justification:
++            "Not implemented, considered not useful as it's a developer feature."
++        })");
++
++  auto resource_request = std::make_unique<network::ResourceRequest>();
++  resource_request->url = GURL(kIPInfoURL);
++  resource_request->method = "GET";
++  resource_request->load_flags =
++      net::LOAD_DO_NOT_SAVE_COOKIES | net::LOAD_DO_NOT_SEND_COOKIES |
++      net::LOAD_BYPASS_CACHE;
++  resource_request->credentials_mode = network::mojom::CredentialsMode::kOmit;
++
++  url_loader_ = network::SimpleURLLoader::Create(std::move(resource_request),
++                                                   traffic_annotation);
++  url_loader_->SetTimeoutDuration(base::Seconds(timeout_seconds));
++
++  url_loader_->DownloadToString(
++      url_loader_factory_.get(),
++      base::BindOnce(&IPFetcher::OnURLLoadComplete, base::Unretained(this),
++                     std::move(callback)),
++      kMaxResponseSize);
++}
++
++void IPFetcher::OnURLLoadComplete(FetchIPCallback callback,
++                                   std::unique_ptr<std::string> response_body) {
++  url_loader_.reset();
++
++  if (!response_body) {
++    LOG(ERROR) << "Err! Connection timed out!";
++    std::move(callback).Run(std::string());
++    return;
++  }
++
++  std::string ip = base::TrimWhitespaceASCII(*response_body, base::TRIM_ALL).as_string();
++
++  if (ip.empty()) {
++    LOG(ERROR) << "Failed to fetch IP: empty response";
++    std::move(callback).Run(std::string());
++    return;
++  }
++
++  LOG(INFO) << "Fetched external IP: " << ip;
++  std::move(callback).Run(std::move(ip));
++}
++
++}  // namespace content
 diff --git a/content/browser/geoip/ip_fetcher.h b/content/browser/geoip/ip_fetcher.h
-index 6bd303aef8695..3484c5eaf3415 100644
---- a/content/browser/geoip/ip_fetcher.h
+new file mode 100644
+index 0000000000000..3484c5eaf3415
+--- /dev/null
 +++ b/content/browser/geoip/ip_fetcher.h
-@@ -10,7 +10,6 @@
- 
- #include "base/functional/callback.h"
- #include "base/memory/scoped_refptr.h"
--#include "content/common/content_export.h"
- 
- namespace network {
- class SharedURLLoaderFactory;
+@@ -0,0 +1,44 @@
++// Copyright 2025 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CONTENT_BROWSER_GEOIP_IP_FETCHER_H_
++#define CONTENT_BROWSER_GEOIP_IP_FETCHER_H_
++
++#include <memory>
++#include <string>
++
++#include "base/functional/callback.h"
++#include "base/memory/scoped_refptr.h"
++
++namespace network {
++class SharedURLLoaderFactory;
++class SimpleURLLoader;
++}  // namespace network
++
++namespace content {
++
++// Fetches external IP address from ipinfo.io
++class CONTENT_EXPORT IPFetcher {
++ public:
++  using FetchIPCallback = base::OnceCallback<void(std::string ip)>;
++
++  explicit IPFetcher(
++      scoped_refptr<network::SharedURLLoaderFactory> url_loader_factory);
++  ~IPFetcher();
++
++  // Fetch IP with timeout (in seconds)
++  // Callback receives empty string on failure
++  void FetchIP(int timeout_seconds, FetchIPCallback callback);
++
++ private:
++  void OnURLLoadComplete(FetchIPCallback callback,
++                         std::unique_ptr<std::string> response_body);
++
++  scoped_refptr<network::SharedURLLoaderFactory> url_loader_factory_;
++  std::unique_ptr<network::SimpleURLLoader> url_loader_;
++};
++
++}  // namespace content
++
++#endif  // CONTENT_BROWSER_GEOIP_IP_FETCHER_H_
+diff --git a/content/browser/geoip/simple_http_client.cc b/content/browser/geoip/simple_http_client.cc
+new file mode 100644
+index 0000000000000..9d7dc9333d80e
+--- /dev/null
++++ b/content/browser/geoip/simple_http_client.cc
+@@ -0,0 +1,275 @@
++// Copyright 2025 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "content/browser/geoip/simple_http_client.h"
++
++#include "base/logging.h"
++#include "base/strings/string_split.h"
++#include "base/strings/string_util.h"
++#include "build/build_config.h"
++
++#if BUILDFLAG(IS_WIN)
++#include <winsock2.h>
++#include <ws2tcpip.h>
++#pragma comment(lib, "ws2_32.lib")
++#else
++#include <arpa/inet.h>
++#include <netdb.h>
++#include <netinet/in.h>
++#include <sys/socket.h>
++#include <sys/time.h>
++#include <unistd.h>
++#endif
++
++#include <string.h>
++
++namespace content {
++
++namespace {
++
++bool SetSocketTimeout(int sock, int seconds) {
++#if BUILDFLAG(IS_WIN)
++  DWORD timeout = seconds * 1000;
++  return setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout,
++                    sizeof(timeout)) == 0;
++#else
++  struct timeval tv;
++  tv.tv_sec = seconds;
++  tv.tv_usec = 0;
++  return setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) == 0;
++#endif
++}
++
++void CloseSocket(int sock) {
++#if BUILDFLAG(IS_WIN)
++  closesocket(sock);
++#else
++  close(sock);
++#endif
++}
++
++// SOCKS5 handshake
++bool SOCKS5Connect(int sock, const std::string& target_host, int target_port) {
++  // SOCKS5 greeting: [VER(5), NMETHODS(1), METHOD(0 - no auth)]
++  unsigned char greeting[] = {0x05, 0x01, 0x00};
++  if (send(sock, (char*)greeting, 3, 0) < 0) {
++    LOG(ERROR) << "SOCKS5: Failed to send greeting";
++    return false;
++  }
++
++  // Response: [VER(5), METHOD(0)]
++  unsigned char response[2];
++  if (recv(sock, (char*)response, 2, 0) < 2) {
++    LOG(ERROR) << "SOCKS5: Failed to receive greeting response";
++    return false;
++  }
++
++  if (response[0] != 0x05 || response[1] != 0x00) {
++    LOG(ERROR) << "SOCKS5: Invalid greeting response";
++    return false;
++  }
++
++  // Connect request: [VER(5), CMD(1-connect), RSV(0), ATYP(3-domain)]
++  std::string connect_req;
++  connect_req.push_back(0x05);  // VER
++  connect_req.push_back(0x01);  // CMD: CONNECT
++  connect_req.push_back(0x00);  // RSV
++  connect_req.push_back(0x03);  // ATYP: Domain name
++  connect_req.push_back((char)target_host.length());  // Domain length
++  connect_req += target_host;  // Domain
++  connect_req.push_back((target_port >> 8) & 0xFF);  // Port high byte
++  connect_req.push_back(target_port & 0xFF);         // Port low byte
++
++  if (send(sock, connect_req.c_str(), connect_req.length(), 0) < 0) {
++    LOG(ERROR) << "SOCKS5: Failed to send connect request";
++    return false;
++  }
++
++  // Response: [VER, REP, RSV, ATYP, BIND_ADDR, BIND_PORT]
++  unsigned char connect_response[10];  // Max for IPv4
++  if (recv(sock, (char*)connect_response, 10, 0) < 4) {
++    LOG(ERROR) << "SOCKS5: Failed to receive connect response";
++    return false;
++  }
++
++  if (connect_response[0] != 0x05) {
++    LOG(ERROR) << "SOCKS5: Invalid version in connect response";
++    return false;
++  }
++
++  if (connect_response[1] != 0x00) {
++    LOG(ERROR) << "SOCKS5: Connect failed, reply code: " << (int)connect_response[1];
++    return false;
++  }
++
++  LOG(INFO) << "SOCKS5: Successfully connected to " << target_host << ":" << target_port;
++  return true;
++}
++
++}  // namespace
++
++std::string FetchURLSimple(const std::string& url,
++                            int timeout_seconds,
++                            const std::string& proxy_server) {
++  // Parse URL - expecting http://ipinfo.io/ip
++  if (url.find("http://ipinfo.io/ip") != 0) {
++    LOG(ERROR) << "Only ipinfo.io/ip is supported";
++    return std::string();
++  }
++
++  const char* target_host = "ipinfo.io";
++  int target_port = 80;
++  const char* path = "/ip";
++
++  std::string proxy_host;
++  int proxy_port = 0;
++  bool use_proxy = false;
++
++  // Parse proxy if provided
++  if (!proxy_server.empty()) {
++    // Expected format: socks5://127.0.0.1:12000
++    std::string proxy = proxy_server;
++
++    // Remove socks5:// prefix
++    if (proxy.find("socks5://") == 0) {
++      proxy = proxy.substr(9);
++    } else if (proxy.find("socks://") == 0) {
++      proxy = proxy.substr(8);
++    }
++
++    // Parse host:port
++    size_t colon_pos = proxy.find(':');
++    if (colon_pos != std::string::npos) {
++      proxy_host = proxy.substr(0, colon_pos);
++      proxy_port = std::stoi(proxy.substr(colon_pos + 1));
++      use_proxy = true;
++      LOG(INFO) << "Using SOCKS5 proxy: " << proxy_host << ":" << proxy_port;
++    } else {
++      LOG(ERROR) << "Invalid proxy format: " << proxy_server;
++      return std::string();
++    }
++  }
++
++#if BUILDFLAG(IS_WIN)
++  WSADATA wsa_data;
++  if (WSAStartup(MAKEWORD(2, 2), &wsa_data) != 0) {
++    LOG(ERROR) << "WSAStartup failed";
++    return std::string();
++  }
++#endif
++
++  // Resolve hostname (proxy or direct)
++  const char* connect_host = use_proxy ? proxy_host.c_str() : target_host;
++  int connect_port = use_proxy ? proxy_port : target_port;
++
++  struct addrinfo hints = {};
++  hints.ai_family = AF_UNSPEC;
++  hints.ai_socktype = SOCK_STREAM;
++
++  std::string port_str = std::to_string(connect_port);
++  struct addrinfo* result = nullptr;
++  if (getaddrinfo(connect_host, port_str.c_str(), &hints, &result) != 0) {
++    LOG(ERROR) << "DNS resolution failed for " << connect_host;
++#if BUILDFLAG(IS_WIN)
++    WSACleanup();
++#endif
++    return std::string();
++  }
++
++  // Create socket
++  int sock = socket(result->ai_family, result->ai_socktype, result->ai_protocol);
++  if (sock < 0) {
++    LOG(ERROR) << "Socket creation failed";
++    freeaddrinfo(result);
++#if BUILDFLAG(IS_WIN)
++    WSACleanup();
++#endif
++    return std::string();
++  }
++
++  // Set timeout
++  if (!SetSocketTimeout(sock, timeout_seconds)) {
++    LOG(WARNING) << "Failed to set socket timeout";
++  }
++
++  // Connect to proxy or target
++  if (connect(sock, result->ai_addr, (int)result->ai_addrlen) < 0) {
++    LOG(ERROR) << "Connection failed to " << connect_host << ":" << connect_port;
++    CloseSocket(sock);
++    freeaddrinfo(result);
++#if BUILDFLAG(IS_WIN)
++    WSACleanup();
++#endif
++    return std::string();
++  }
++
++  freeaddrinfo(result);
++
++  // If using proxy, do SOCKS5 handshake
++  if (use_proxy) {
++    if (!SOCKS5Connect(sock, target_host, target_port)) {
++      LOG(ERROR) << "SOCKS5 handshake failed";
++      CloseSocket(sock);
++#if BUILDFLAG(IS_WIN)
++      WSACleanup();
++#endif
++      return std::string();
++    }
++  }
++
++  // Send HTTP GET request
++  std::string request = "GET " + std::string(path) + " HTTP/1.1\r\n";
++  request += "Host: " + std::string(target_host) + "\r\n";
++  request += "Connection: close\r\n";
++  request += "User-Agent: Chromium-GeoIP/1.0\r\n";
++  request += "\r\n";
++
++  if (send(sock, request.c_str(), (int)request.length(), 0) < 0) {
++    LOG(ERROR) << "Send failed";
++    CloseSocket(sock);
++#if BUILDFLAG(IS_WIN)
++    WSACleanup();
++#endif
++    return std::string();
++  }
++
++  // Receive response
++  std::string response;
++  char buffer[1024];
++  int bytes_received;
++
++  while ((bytes_received = recv(sock, buffer, sizeof(buffer) - 1, 0)) > 0) {
++    buffer[bytes_received] = '\0';
++    response += buffer;
++  }
++
++  CloseSocket(sock);
++#if BUILDFLAG(IS_WIN)
++  WSACleanup();
++#endif
++
++  if (response.empty()) {
++    LOG(ERROR) << "Empty response";
++    return std::string();
++  }
++
++  // Parse HTTP response - find body (after \r\n\r\n)
++  size_t body_pos = response.find("\r\n\r\n");
++  if (body_pos == std::string::npos) {
++    LOG(ERROR) << "Invalid HTTP response";
++    return std::string();
++  }
++
++  std::string body = response.substr(body_pos + 4);
++  std::string ip = std::string(base::TrimWhitespaceASCII(body, base::TRIM_ALL));
++
++  if (ip.empty()) {
++    LOG(ERROR) << "Empty IP in response";
++    return std::string();
++  }
++
++  return ip;
++}
++
++}  // namespace content
 diff --git a/content/browser/geoip/simple_http_client.h b/content/browser/geoip/simple_http_client.h
-index 1ff55c583c02c..afc454479c00b 100644
---- a/content/browser/geoip/simple_http_client.h
+new file mode 100644
+index 0000000000000..afc454479c00b
+--- /dev/null
 +++ b/content/browser/geoip/simple_http_client.h
-@@ -6,7 +6,6 @@
- #define CONTENT_BROWSER_GEOIP_SIMPLE_HTTP_CLIENT_H_
- 
- #include <string>
--#include "content/common/content_export.h"
- 
- namespace content {
- 
+@@ -0,0 +1,22 @@
++// Copyright 2025 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CONTENT_BROWSER_GEOIP_SIMPLE_HTTP_CLIENT_H_
++#define CONTENT_BROWSER_GEOIP_SIMPLE_HTTP_CLIENT_H_
++
++#include <string>
++
++namespace content {
++
++// Simple synchronous HTTP GET client for early browser startup
++// Supports both direct connection and SOCKS5 proxy
++// Returns empty string on failure/timeout
++std::string FetchURLSimple(
++    const std::string& url,
++    int timeout_seconds,
++    const std::string& proxy_server = std::string());
++
++}  // namespace content
++
++#endif  // CONTENT_BROWSER_GEOIP_SIMPLE_HTTP_CLIENT_H_
 diff --git a/content/browser/renderer_host/render_process_host_impl.cc b/content/browser/renderer_host/render_process_host_impl.cc
 index 3a042e5ef423d..9fb7ea3a11506 100644
 --- a/content/browser/renderer_host/render_process_host_impl.cc
@@ -306,3 +1049,55 @@ index 3a042e5ef423d..9fb7ea3a11506 100644
    command_line->AppendSwitchASCII(switches::kLang, locale);
  
    // A non-empty RendererCmdPrefix implies that Zygote is disabled.
+diff --git a/content/browser/web_contents/web_contents_impl.cc b/content/browser/web_contents/web_contents_impl.cc
+index 4c901b7769575..ce084e2018b8e 100644
+--- a/content/browser/web_contents/web_contents_impl.cc
++++ b/content/browser/web_contents/web_contents_impl.cc
+@@ -198,6 +198,7 @@
+ #include "third_party/blink/public/common/page/page_zoom.h"
+ #include "third_party/blink/public/common/page_state/page_state.h"
+ #include "third_party/blink/public/common/permissions/permission_utils.h"
++#include "content/browser/geoip/geoip_initializer.h"
+ #include "third_party/blink/public/common/security/protocol_handler_security_level.h"
+ #include "third_party/blink/public/common/switches.h"
+ #include "third_party/blink/public/common/web_preferences/web_preferences.h"
+@@ -9163,6 +9164,13 @@ const blink::RendererPreferences& WebContentsImpl::GetRendererPrefs(
+     return guest->GetRendererPrefs();
+   }
+   RenderViewHostImpl::GetPlatformSpecificPrefs(&renderer_preferences_);
++
++  // Override accept_languages with GeoIP locale if initialized
++  std::string geoip_locale = GetGeoIPLocale();
++  if (!geoip_locale.empty()) {
++    renderer_preferences_.accept_languages = geoip_locale;
++  }
++
+   return renderer_preferences_;
+ }
+ 
+diff --git a/content/public/common/content_switches.cc b/content/public/common/content_switches.cc
+index 9400f5a8d3785..3dbb3a133227f 100644
+--- a/content/public/common/content_switches.cc
++++ b/content/public/common/content_switches.cc
+@@ -983,6 +983,9 @@ const char kAudioProcessHighPriority[] = "audio-process-high-priority";
+ const char kRemoteDebuggingIoPipes[] = "remote-debugging-io-pipes";
+ #endif
+ 
++// Enables GeoIP-based timezone and locale detection.
++const char kGeoIP[] = "geoip";
++
+ #if defined(ENABLE_IPC_FUZZER)
+ // Dumps IPC messages sent from renderer processes to the browser process to
+ // the given directory. Used primarily to gather samples for IPC fuzzing.
+diff --git a/content/public/common/content_switches.h b/content/public/common/content_switches.h
+index de98d201e76c4..a30ecef421e33 100644
+--- a/content/public/common/content_switches.h
++++ b/content/public/common/content_switches.h
+@@ -276,6 +276,7 @@ CONTENT_EXPORT extern const char kFontCacheSharedHandle[];
+ CONTENT_EXPORT extern const char kRaiseTimerFrequency[];
+ CONTENT_EXPORT extern const char kGpu2StartupDialog[];
+ CONTENT_EXPORT extern const char kAudioProcessHighPriority[];
++extern const char kGeoIP[];
+ // Pipe names for the incoming and outbound messages.
+ CONTENT_EXPORT extern const char kRemoteDebuggingIoPipes[];
+ #endif
